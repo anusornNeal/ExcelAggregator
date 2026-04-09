@@ -1,0 +1,90 @@
+package presentation
+
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import domain.usecase.AggregateInvoicesUseCase
+import domain.usecase.BuildStatusMessageUseCase
+import domain.usecase.DiagnoseFileUseCase
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import presentation.contract.ViewContract
+import java.io.File
+
+class AggregatorViewModel(
+    private val aggregateInvoices: AggregateInvoicesUseCase = AggregateInvoicesUseCase(),
+    private val diagnoseFile: DiagnoseFileUseCase = DiagnoseFileUseCase(),
+    private val buildStatusMessage: BuildStatusMessageUseCase = BuildStatusMessageUseCase()
+) {
+    var state by mutableStateOf(ViewContract.State())
+        private set
+
+    private val _effects = mutableStateListOf<ViewContract.Effect>()
+    val effects: List<ViewContract.Effect> get() = _effects
+
+    private val eventBus = MutableSharedFlow<ViewContract.Event>(extraBufferCapacity = 64)
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    init { scope.launch { eventBus.collect { onEvent(it) } } }
+
+    fun sendEvent(event: ViewContract.Event) { scope.launch { eventBus.emit(event) } }
+
+    fun consumeEffect(effect: ViewContract.Effect) { _effects.remove(effect) }
+
+    private fun onEvent(event: ViewContract.Event) {
+        when (event) {
+            ViewContract.Event.PickFiles        -> _effects.add(ViewContract.Effect.OpenPickFilesDialog)
+            ViewContract.Event.PickFolder       -> _effects.add(ViewContract.Effect.OpenPickFolderDialog)
+            ViewContract.Event.BrowseOutput     -> _effects.add(ViewContract.Effect.OpenSaveDialog)
+            is ViewContract.Event.AddFiles      -> addFiles(event.files)
+            is ViewContract.Event.RemoveFile    -> removeFile(event.file)
+            is ViewContract.Event.DiagnoseFile  -> runDiagnose(event.file)
+            ViewContract.Event.ClearFiles       -> state = state.copy(selectedFiles = emptyList(), statusMessage = "")
+            is ViewContract.Event.SetOutputPath -> state = state.copy(outputPath = event.path)
+            ViewContract.Event.Process          -> startProcessing()
+        }
+    }
+
+    private fun addFiles(files: List<File>) {
+        if (files.isEmpty()) return
+        val merged = (state.selectedFiles + files).distinctBy { it.absolutePath }
+        state = state.copy(selectedFiles = merged, statusMessage = "เลือก ${merged.size} ไฟล์")
+    }
+
+    private fun removeFile(file: File) {
+        val remain = state.selectedFiles.filter { it != file }
+        state = state.copy(selectedFiles = remain, statusMessage = "เลือก ${remain.size} ไฟล์")
+    }
+
+    private fun startProcessing() {
+        if (state.selectedFiles.isEmpty()) { state = state.copy(statusMessage = "⚠️ กรุณาเลือกไฟล์ก่อน"); return }
+        if (state.outputPath.isBlank())    { state = state.copy(statusMessage = "⚠️ กรุณาระบุชื่อไฟล์ผลลัพธ์"); return }
+        state = state.copy(isProcessing = true, statusMessage = "กำลังประมวลผล...")
+        _effects.add(ViewContract.Effect.StartProcessing)
+    }
+
+    suspend fun processFiles() {
+        try {
+            val result = withContext(Dispatchers.IO) {
+                aggregateInvoices.execute(state.selectedFiles, state.outputPath)
+            }
+            val status = buildStatusMessage.execute(result)
+            state = state.copy(selectedFiles = emptyList(), isProcessing = false, statusMessage = status)
+        } catch (e: Exception) {
+            state = state.copy(isProcessing = false, statusMessage = "❌ เกิดข้อผิดพลาด: ${e.message}")
+        }
+    }
+
+    private fun runDiagnose(file: File) {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { diagnoseFile.execute(file) }
+            runCatching { java.awt.Desktop.getDesktop().open(File(result.reportPath)) }
+            state = state.copy(statusMessage = "Diagnostic written: ${result.reportPath}")
+        }
+    }
+}
