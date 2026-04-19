@@ -6,6 +6,7 @@ plugins {
     kotlin("jvm")
     id("org.jetbrains.compose")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.github.johnrengelman.shadow") version "8.1.1"
 }
 
 group = "org.example"
@@ -39,6 +40,8 @@ dependencies {
 
     // Logging
     implementation("org.slf4j:slf4j-simple:2.0.13")
+
+    testImplementation(kotlin("test"))
 }
 
 kotlin {
@@ -56,9 +59,19 @@ compose.desktop {
         mainClass = "MainKt"
 
         nativeDistributions {
-            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
+            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Exe)
             packageName = "ExcelAggregator"
             packageVersion = "1.0.0"
         }
     }
+}
+
+
+// Make the uber jar part of the build lifecycle
+tasks.named("build") {
+    dependsOn("shadowJar")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }

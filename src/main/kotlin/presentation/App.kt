@@ -1,9 +1,16 @@
 package presentation
 
 import androidx.compose.desktop.ui.tooling.preview.Preview
-import androidx.compose.foundation.layout.*
-import androidx.compose.material.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.MaterialTheme
+import androidx.compose.material.lightColors
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
@@ -11,7 +18,6 @@ import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import presentation.components.ButtonRow
 import presentation.components.FileList
-import presentation.components.OutputRow
 import presentation.components.ProcessButton
 import presentation.components.StatusBox
 import presentation.components.UiHeader
@@ -46,8 +52,6 @@ private fun EffectsHandler(vm: AggregatorViewModel) {
                         if (excels.isNotEmpty()) vm.sendEvent(ViewContract.Event.AddFiles(excels))
                     }
                 }
-                ViewContract.Effect.OpenSaveDialog ->
-                    saveExcelFile()?.let { vm.sendEvent(ViewContract.Event.SetOutputPath(it.absolutePath)) }
                 ViewContract.Effect.StartProcessing -> vm.processFiles()
             }
             vm.consumeEffect(effect)
@@ -65,8 +69,6 @@ private fun AppContent(state: ViewContract.State, sendEvent: (ViewContract.Event
             Spacer(Modifier.size(12.dp))
             if (state.selectedFiles.isNotEmpty()) FileList(state = state, sendEvent = sendEvent)
             Spacer(Modifier.size(12.dp))
-            OutputRow(state = state, sendEvent = sendEvent)
-            Spacer(Modifier.size(12.dp))
             ProcessButton(state = state, sendEvent = sendEvent)
             if (state.statusMessage.isNotEmpty()) {
                 Spacer(Modifier.size(8.dp))
@@ -76,10 +78,6 @@ private fun AppContent(state: ViewContract.State, sendEvent: (ViewContract.Event
     }
 }
 
-// -------------------------------------------------------------------------
-// Dialog helpers
-// -------------------------------------------------------------------------
-
 private fun pickExcelFiles(): List<File> {
     UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
     val chooser = JFileChooser().apply {
@@ -87,8 +85,11 @@ private fun pickExcelFiles(): List<File> {
         fileFilter = FileNameExtensionFilter("Excel Files (*.xlsx, *.xls)", "xlsx", "xls")
         dialogTitle = "เลือกไฟล์ Excel"
     }
-    return if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION)
-        chooser.selectedFiles.toList() else emptyList()
+    return if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) {
+        chooser.selectedFiles.toList()
+    } else {
+        emptyList()
+    }
 }
 
 private fun pickFolder(): File? {
@@ -100,21 +101,6 @@ private fun pickFolder(): File? {
     return if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) chooser.selectedFile else null
 }
 
-private fun saveExcelFile(): File? {
-    UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
-    val chooser = JFileChooser().apply {
-        fileFilter = FileNameExtensionFilter("Excel Files (*.xlsx)", "xlsx")
-        dialogTitle = "บันทึกไฟล์ผลลัพธ์"
-        selectedFile = File("aggregated_output.xlsx")
-    }
-    return if (chooser.showSaveDialog(null) == JFileChooser.APPROVE_OPTION) {
-        val f = chooser.selectedFile
-        if (f.extension.lowercase() != "xlsx") File(f.absolutePath + ".xlsx") else f
-    } else null
-}
-
 fun main() = application {
     Window(onCloseRequest = ::exitApplication, title = "Excel Aggregator") { App() }
 }
-
-

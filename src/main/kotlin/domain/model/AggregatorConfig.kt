@@ -2,6 +2,7 @@ package domain.model
 
 /** Simple configuration for the aggregator. Values come from aggregator.properties (working dir) or defaults. */
 data class AggregatorConfig(
+    val documentKeywords: List<String> = listOf("ใบส่งสินค้า", "invoice"),
     val dateKeywords: List<String> = listOf("วันที่", "Date"),
     val branchKeywords: List<String> = listOf("สาขา", "Branch"),
     val headerKeyword: String = "ราคา",
@@ -11,7 +12,6 @@ data class AggregatorConfig(
     val totalKeywords: List<String> = listOf("Total", "รวม"),
     val gpKeyword: String = "GP",
     val gpTargets: List<Double> = listOf(0.12, 0.16, 0.2),
-    // labels used in output
     val labelFilePrefix: String = "ไฟล์ที่ ",
     val labelDate: String = "วันที่ :",
     val labelBranch: String = "สาขา :",
@@ -21,4 +21,3 @@ data class AggregatorConfig(
     val labelTotal: String = "Total",
     val labelGp: String = "GP"
 )
-

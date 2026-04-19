@@ -5,14 +5,23 @@ import domain.model.AggregatorConfig
 import domain.model.PriceRow
 import domain.model.SheetData
 import org.apache.poi.ss.usermodel.Cell
+import org.apache.poi.ss.usermodel.CellType
+import org.apache.poi.ss.usermodel.DateUtil
+import org.apache.poi.ss.usermodel.FormulaEvaluator
 import org.apache.poi.ss.usermodel.Row
 import org.apache.poi.ss.usermodel.Sheet
 import org.apache.poi.ss.usermodel.WorkbookFactory
 import java.io.File
 import java.io.FileInputStream
+import java.text.SimpleDateFormat
+import kotlin.math.abs
 
 /** Reads and parses invoice Excel files into domain model objects. */
 object InvoiceExcelReader {
+    private val whitespaceRegex = Regex("\\s+")
+    private val numericCleanupRegex = Regex("[,\\s]")
+    private val headerNoiseTokens = arrayOf("sum of", "subtotal")
+    private val outputDateFormat = SimpleDateFormat("d/M/yyyy")
 
     // -------------------------------------------------------------------------
     // Public API
@@ -20,10 +29,15 @@ object InvoiceExcelReader {
 
     fun readAll(file: File, config: AggregatorConfig = ConfigLoader.load()): List<SheetData> =
         runCatching {
+            val readerConfig = ReaderConfig(config)
             FileInputStream(file).use { fis ->
                 WorkbookFactory.create(fis).use { wb ->
                     (0 until wb.numberOfSheets).mapNotNull { index ->
-                        parseSheet(wb.getSheetAt(index), index, file.name, config)
+                        if (wb.isSheetHidden(index) || wb.isSheetVeryHidden(index)) {
+                            null
+                        } else {
+                            parseSheet(wb.getSheetAt(index), index, file.name, readerConfig)
+                        }
                     }
                 }
             }
@@ -31,9 +45,14 @@ object InvoiceExcelReader {
 
     fun diagnose(file: File, config: AggregatorConfig = ConfigLoader.load()): String =
         runCatching {
+            val readerConfig = ReaderConfig(config)
             FileInputStream(file).use { fis ->
                 WorkbookFactory.create(fis).use { wb ->
-                    buildDiagnosticReport(wb.getSheetAt(0), file, config)
+                    val visibleSheet = (0 until wb.numberOfSheets)
+                        .firstOrNull { !wb.isSheetHidden(it) && !wb.isSheetVeryHidden(it) }
+                        ?.let(wb::getSheetAt)
+                        ?: return@use "No visible sheets found"
+                    buildDiagnosticReport(visibleSheet, file, readerConfig)
                 }
             }
         }.getOrElse { e -> "Failed to open/read file: ${e.message}" }
@@ -42,9 +61,11 @@ object InvoiceExcelReader {
     // Sheet parsing
     // -------------------------------------------------------------------------
 
-    private fun parseSheet(sheet: Sheet, index: Int, fileName: String, config: AggregatorConfig): SheetData? {
+    private fun parseSheet(sheet: Sheet, index: Int, fileName: String, config: ReaderConfig): SheetData? {
+        if (!isValidInvoiceSheet(sheet, config)) return null
         val (date, branch) = parseDateAndBranch(sheet, config)
         val (headerRowIndex, columns) = detectHeaderAndColumns(sheet, config) ?: return null
+        if (date.isBlank() || branch.isBlank()) return null
         val rows = parseDataRows(sheet, headerRowIndex, columns, config)
         return rows.takeIf { it.isNotEmpty() }
             ?.let { SheetData(date = date, branch = branch, rows = it, sourceFileName = fileName, sourceSheetIndex = index, sourceSheetName = sheet.sheetName) }
@@ -54,49 +75,96 @@ object InvoiceExcelReader {
     // Header detection
     // -------------------------------------------------------------------------
 
+    private data class ReaderConfig(
+        val documentKeywords: List<String>,
+        val priceColumn: Int,
+        val labelPrice: String,
+        val labelValue: String,
+        val labelTotal: String,
+        val labelQty: String,
+        val dateKeywords: List<String>,
+        val branchKeywords: List<String>,
+        val totalKeywords: List<String>,
+        val gpKeyword: String
+    ) {
+        constructor(config: AggregatorConfig) : this(
+            documentKeywords = config.documentKeywords.map { normalize(it).lowercase() },
+            priceColumn = config.priceColumn,
+            labelPrice = normalize(config.labelPrice).lowercase(),
+            labelValue = normalize(config.labelValue).lowercase(),
+            labelTotal = normalize(config.labelTotal).lowercase(),
+            labelQty = normalize(config.labelQty).lowercase(),
+            dateKeywords = config.dateKeywords.map { normalize(it) },
+            branchKeywords = config.branchKeywords.map { normalize(it) },
+            totalKeywords = config.totalKeywords.map { normalize(it) },
+            gpKeyword = normalize(config.gpKeyword)
+        )
+    }
+
     private data class ColumnMapping(val price: Int, val qty: Int, val value: Int)
     private data class HeaderScanResult(val found: Boolean, val price: Int, val qty: Int, val value: Int)
 
-    private fun detectHeaderAndColumns(sheet: Sheet, config: AggregatorConfig): Pair<Int, ColumnMapping>? {
+    private fun detectHeaderAndColumns(sheet: Sheet, config: ReaderConfig): Pair<Int, ColumnMapping>? {
         val labels = HeaderLabels(config)
         for (row in sheet) {
             val scan = scanRowForHeader(row, labels)
             if (!scan.found) continue
 
-            val initial = ColumnMapping(
-                price = scan.price.takeIf { it >= 0 } ?: config.priceColumn,
-                qty   = scan.qty.takeIf   { it >= 0 } ?: config.qtyColumn,
-                value = scan.value.takeIf { it >= 0 } ?: config.valueColumn
-            )
-            val sampleRange = (row.rowNum + 1)..minOf(sheet.lastRowNum, row.rowNum + 21)
-            val final = if (!sampleRange.isEmpty()) adjustColumnMapping(sheet, sampleRange, initial) else initial
-            return row.rowNum to final
+            val initial = buildInitialMapping(scan, config)
+            val sampleRange = sampleRangeAfter(row.rowNum, sheet.lastRowNum)
+            val resolved = sampleRange?.let { adjustColumnMapping(sheet, it, initial) } ?: initial
+            return row.rowNum to resolved
         }
         return null
     }
 
-    private data class HeaderLabels(val price: String, val value: String, val total: String, val qty: String) {
-        constructor(config: AggregatorConfig) : this(
-            price = normalize(config.labelPrice).lowercase(),
-            value = normalize(config.labelValue).lowercase(),
-            total = normalize(config.labelTotal).lowercase(),
-            qty   = normalize(config.labelQty).lowercase()
+    private fun buildInitialMapping(scan: HeaderScanResult, config: ReaderConfig): ColumnMapping {
+        val anchor = resolveAnchor(scan, config)
+        return ColumnMapping(
+            price = scan.price.takeIf { it >= 0 } ?: anchor,
+            qty = scan.qty.takeIf { it >= 0 } ?: (anchor + 1),
+            value = scan.value.takeIf { it >= 0 } ?: (anchor + 2)
         )
     }
 
-    private fun scanRowForHeader(row: Row, labels: HeaderLabels): HeaderScanResult {
-        val headerMarkers = setOf(labels.price, labels.value, labels.total)
-        val colByLabel = row
-            .associateBy { cleanedCellText(it) }
-            .mapValues { (_, cell) -> cell.columnIndex }
+    private fun resolveAnchor(scan: HeaderScanResult, config: ReaderConfig): Int =
+        when {
+            scan.price >= 0 -> scan.price
+            scan.qty >= 0 -> scan.qty - 1
+            scan.value >= 0 -> scan.value - 2
+            else -> config.priceColumn
+        }.coerceAtLeast(0)
 
-        val found = colByLabel.keys.any { it.isNotEmpty() && it in headerMarkers }
-        return HeaderScanResult(
-            found  = found,
-            price  = colByLabel[labels.price] ?: -1,
-            qty    = colByLabel[labels.qty]   ?: -1,
-            value  = colByLabel[labels.value] ?: -1
-        )
+    private fun sampleRangeAfter(rowIndex: Int, lastRowIndex: Int): IntRange? {
+        val end = minOf(lastRowIndex, rowIndex + 21)
+        return if (end > rowIndex) (rowIndex + 1)..end else null
+    }
+
+    private data class HeaderLabels(val price: String, val value: String, val total: String, val qty: String) {
+        constructor(config: ReaderConfig) : this(config.labelPrice, config.labelValue, config.labelTotal, config.labelQty)
+    }
+
+    private fun scanRowForHeader(row: Row, labels: HeaderLabels): HeaderScanResult {
+        var found = false
+        var price = -1
+        var qty = -1
+        var value = -1
+
+        for (cell in row) {
+            when (cleanedCellText(cell)) {
+                labels.price -> {
+                    found = true
+                    price = cell.columnIndex
+                }
+                labels.value, labels.total -> {
+                    found = true
+                    value = cell.columnIndex
+                }
+                labels.qty -> qty = cell.columnIndex
+            }
+        }
+
+        return HeaderScanResult(found = found, price = price, qty = qty, value = value)
     }
 
     // -------------------------------------------------------------------------
@@ -105,41 +173,74 @@ object InvoiceExcelReader {
 
     private fun adjustColumnMapping(sheet: Sheet, sampleRange: IntRange, initial: ColumnMapping): ColumnMapping {
         val maxCols  = maxOf(sheet.getRow(sampleRange.first)?.lastCellNum?.toInt() ?: 0, 10)
-        val qtyStats = sampleStats(sheet, initial.qty, sampleRange)
+        val statsCache = HashMap<Int, ColStats>(maxCols)
+        fun statsFor(col: Int): ColStats = statsCache.getOrPut(col) { sampleStats(sheet, col, sampleRange) }
+
+        val qtyStats = statsFor(initial.qty)
         val skuCol   = detectSkuColumn(sheet, sampleRange, maxCols)
         return when {
-            skuCol >= 0              -> adjustWithSkuColumn(sheet, sampleRange, initial, skuCol, qtyStats.numericCount, maxCols)
-            qtyStats.numericCount == 0 -> adjustWithFallbackQty(sheet, sampleRange, initial, maxCols)
+            skuCol >= 0                -> adjustWithSkuColumn(initial, skuCol, qtyStats.numericCount, maxCols, sampleRange) { col -> statsFor(col) }
+            qtyStats.numericCount == 0 -> adjustWithFallbackQty(initial, maxCols) { col -> statsFor(col) }
             else                     -> initial
         }
     }
 
     private fun adjustWithSkuColumn(
-        sheet: Sheet, sampleRange: IntRange, initial: ColumnMapping,
-        skuCol: Int, qtyNumCount: Int, maxCols: Int
+        initial: ColumnMapping,
+        skuCol: Int,
+        qtyNumCount: Int,
+        maxCols: Int,
+        sampleRange: IntRange,
+        statsFor: (Int) -> ColStats
     ): ColumnMapping {
-        val skuStats  = sampleStats(sheet, skuCol, sampleRange)
+        val skuStats  = statsFor(skuCol)
         val minUseful = (sampleRange.last - sampleRange.first + 1) / 4
         if (qtyNumCount >= 2 || skuStats.numericCount < minUseful) return initial
 
-        val byAvgDescending = (0 until maxCols)
-            .map { c -> c to sampleStats(sheet, c, sampleRange).average }
-            .sortedByDescending { it.second }
-            .map { it.first }
-            .filter { it != skuCol }
+        var bestCol = initial.value
+        var secondBestCol = initial.price
+        var bestAvg = Double.NEGATIVE_INFINITY
+        var secondBestAvg = Double.NEGATIVE_INFINITY
+
+        for (col in 0 until maxCols) {
+            if (col == skuCol) continue
+            val average = statsFor(col).average
+            if (average > bestAvg) {
+                secondBestAvg = bestAvg
+                secondBestCol = bestCol
+                bestAvg = average
+                bestCol = col
+            } else if (average > secondBestAvg) {
+                secondBestAvg = average
+                secondBestCol = col
+            }
+        }
 
         return ColumnMapping(
-            price = byAvgDescending.getOrElse(1) { initial.price },
+            price = secondBestCol,
             qty   = skuCol,
-            value = byAvgDescending.getOrElse(0) { initial.value }
+            value = bestCol
         )
     }
 
     private fun adjustWithFallbackQty(
-        sheet: Sheet, sampleRange: IntRange, initial: ColumnMapping, maxCols: Int
+        initial: ColumnMapping,
+        maxCols: Int,
+        statsFor: (Int) -> ColStats
     ): ColumnMapping {
-        val numericCols = (0 until maxCols).filter { c -> sampleStats(sheet, c, sampleRange).numericCount > 0 }
-        val fallbackQty = numericCols.firstOrNull { it != initial.price } ?: numericCols.firstOrNull() ?: initial.qty
+        var fallbackQty = initial.qty
+        var firstNumericCol = -1
+
+        for (col in 0 until maxCols) {
+            if (statsFor(col).numericCount <= 0) continue
+            if (firstNumericCol < 0) firstNumericCol = col
+            if (col != initial.price) {
+                fallbackQty = col
+                break
+            }
+        }
+
+        if (fallbackQty == initial.qty && firstNumericCol >= 0) fallbackQty = firstNumericCol
         return initial.copy(qty = fallbackQty)
     }
 
@@ -147,7 +248,7 @@ object InvoiceExcelReader {
     // Data row parsing
     // -------------------------------------------------------------------------
 
-    private fun parseDataRows(sheet: Sheet, headerRowIndex: Int, cols: ColumnMapping, config: AggregatorConfig): List<PriceRow> {
+    private fun parseDataRows(sheet: Sheet, headerRowIndex: Int, cols: ColumnMapping, config: ReaderConfig): List<PriceRow> {
         val rows = mutableListOf<PriceRow>()
         var hasData = false
 
@@ -170,7 +271,23 @@ object InvoiceExcelReader {
         return rows
     }
 
-    private fun classifyAndBuildRow(rawPrice: String, rawQty: String, rawValue: String, config: AggregatorConfig): PriceRow? {
+    private fun isValidInvoiceSheet(sheet: Sheet, config: ReaderConfig): Boolean {
+        val titleFound = (0..minOf(sheet.lastRowNum, 12)).any { rowIndex ->
+            val row = sheet.getRow(rowIndex) ?: return@any false
+            row.any { cell ->
+                val text = normalize(CellUtils.getCellString(cell)).lowercase()
+                text.isNotBlank() && config.documentKeywords.any { keyword -> text.contains(keyword) }
+            }
+        }
+        if (!titleFound) return false
+
+        val (date, branch) = parseDateAndBranch(sheet, config)
+        if (date.isBlank() || branch.isBlank()) return false
+
+        return detectHeaderAndColumns(sheet, config) != null
+    }
+
+    private fun classifyAndBuildRow(rawPrice: String, rawQty: String, rawValue: String, config: ReaderConfig): PriceRow? {
         val numericPrice = normalizeNumber(rawPrice)
         val numericQty   = normalizeNumber(rawQty)
         val numericValue = normalizeNumber(rawValue)
@@ -193,14 +310,15 @@ object InvoiceExcelReader {
     // Date / branch detection
     // -------------------------------------------------------------------------
 
-    private fun parseDateAndBranch(sheet: Sheet, config: AggregatorConfig): Pair<String, String> {
+    private fun parseDateAndBranch(sheet: Sheet, config: ReaderConfig): Pair<String, String> {
         var date   = ""
         var branch = ""
+        val evaluator = sheet.workbook.creationHelper.createFormulaEvaluator()
         for (row in sheet) {
             for (cell in row) {
                 val text = normalize(CellUtils.getCellString(cell))
-                if (date.isEmpty()   && config.dateKeywords.any   { text.contains(normalize(it)) }) date   = nextCellText(row, cell)
-                if (branch.isEmpty() && config.branchKeywords.any { text.contains(normalize(it)) }) branch = nextCellText(row, cell)
+                if (date.isEmpty()   && config.dateKeywords.any { text.contains(it) }) date   = nextDateText(row, cell, evaluator)
+                if (branch.isEmpty() && config.branchKeywords.any { text.contains(it) }) branch = nextCellText(row, cell)
             }
             if (date.isNotEmpty() && branch.isNotEmpty()) break
         }
@@ -210,19 +328,46 @@ object InvoiceExcelReader {
     private fun nextCellText(row: Row, cell: Cell): String =
         normalize(CellUtils.getCellString(row.getCell(cell.columnIndex + 1)))
 
+    private fun nextDateText(row: Row, cell: Cell, evaluator: FormulaEvaluator): String {
+        val adjacentCell = row.getCell(cell.columnIndex + 1)
+        return normalize(extractDateText(adjacentCell, evaluator) ?: CellUtils.getCellString(adjacentCell))
+    }
+
+    private fun extractDateText(cell: Cell?, evaluator: FormulaEvaluator): String? {
+        if (cell == null) return null
+
+        return when (cell.cellType) {
+            CellType.NUMERIC ->
+                cell.numericCellValue.takeIf { looksLikeExcelDateSerial(it) }?.let { outputDateFormat.format(DateUtil.getJavaDate(it)) }
+
+            CellType.FORMULA -> {
+                val evaluated = runCatching { evaluator.evaluate(cell) }.getOrNull()
+                when (evaluated?.cellType) {
+                    CellType.NUMERIC ->
+                        evaluated.numberValue.takeIf { looksLikeExcelDateSerial(it) }?.let { outputDateFormat.format(DateUtil.getJavaDate(it)) }
+
+                    else -> null
+                }
+            }
+
+            else -> null
+        }
+    }
+
+    private fun looksLikeExcelDateSerial(value: Double): Boolean =
+        DateUtil.isValidExcelDate(value) && abs(value - value.toLong()) < 0.0000001 && value in 20000.0..60000.0
+
     // -------------------------------------------------------------------------
     // Row classification predicates
     // -------------------------------------------------------------------------
 
-    private fun isTotalRow(rawPrice: String, config: AggregatorConfig): Boolean {
+    private fun isTotalRow(rawPrice: String, config: ReaderConfig): Boolean {
         val normalised = normalize(rawPrice)
-        return config.totalKeywords.any { kw ->
-            normalised.equals(normalize(kw), ignoreCase = true) || normalised.contains(normalize(kw))
-        }
+        return config.totalKeywords.any { kw -> normalised.equals(kw, ignoreCase = true) || normalised.contains(kw) }
     }
 
-    private fun isGpRow(rawPrice: String, rawQty: String, config: AggregatorConfig): Boolean =
-        normalize(rawPrice).equals(normalize(config.gpKeyword), ignoreCase = true) && rawQty.isNotEmpty()
+    private fun isGpRow(rawPrice: String, rawQty: String, config: ReaderConfig): Boolean =
+        normalize(rawPrice).equals(config.gpKeyword, ignoreCase = true) && rawQty.isNotEmpty()
 
     // -------------------------------------------------------------------------
     // Sample statistics & SKU detection
@@ -242,17 +387,28 @@ object InvoiceExcelReader {
 
     private fun detectSkuColumn(sheet: Sheet, range: IntRange, maxCols: Int): Int {
         fun isSkuLike(text: String) = text.length >= 4 && text.any { it.isLetter() } && text.any { it.isDigit() } && text.contains('-')
-        val best = (0 until maxCols).maxByOrNull { col ->
-            range.count { r -> isSkuLike(normalize(CellUtils.getCellString(sheet.getRow(r)?.getCell(col)))) }
+        var bestCol = -1
+        var bestCount = 0
+
+        for (col in 0 until maxCols) {
+            var count = 0
+            for (r in range) {
+                if (isSkuLike(normalize(CellUtils.getCellString(sheet.getRow(r)?.getCell(col))))) count++
+            }
+            if (count > bestCount) {
+                bestCount = count
+                bestCol = col
+            }
         }
-        return best.takeIf { it != null && range.count { r -> isSkuLike(normalize(CellUtils.getCellString(sheet.getRow(r)?.getCell(it)))) } > 0 } ?: -1
+
+        return bestCol.takeIf { bestCount > 0 } ?: -1
     }
 
     // -------------------------------------------------------------------------
     // Diagnostics
     // -------------------------------------------------------------------------
 
-    private fun buildDiagnosticReport(sheet: Sheet, file: File, config: AggregatorConfig): String {
+    private fun buildDiagnosticReport(sheet: Sheet, file: File, config: ReaderConfig): String {
         val (date, branch) = parseDateAndBranch(sheet, config)
         val header = detectHeaderAndColumns(sheet, config)
         return buildString {
@@ -286,14 +442,11 @@ object InvoiceExcelReader {
     // -------------------------------------------------------------------------
 
     private fun cleanedCellText(cell: Cell): String =
-        listOf("sum of", "subtotal").fold(normalize(CellUtils.getCellString(cell)).lowercase()) { acc, t -> acc.replace(t, "") }.trim()
+        headerNoiseTokens.fold(normalize(CellUtils.getCellString(cell)).lowercase()) { acc, token -> acc.replace(token, "") }.trim()
 
     private fun normalize(s: String?): String =
-        s?.trim()?.replace("\u00A0", " ")?.replace(Regex("\\s+"), " ") ?: ""
+        s?.trim()?.replace("\u00A0", " ")?.replace(whitespaceRegex, " ") ?: ""
 
     private fun normalizeNumber(s: String?): String =
-        s?.trim()?.replace("\u00A0", " ")?.replace(Regex("[,\\s]"), "")?.replace("\u200B", "") ?: ""
+        s?.trim()?.replace("\u00A0", " ")?.replace(numericCleanupRegex, "")?.replace("\u200B", "") ?: ""
 }
-
-
-

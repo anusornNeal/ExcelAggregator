@@ -30,53 +30,75 @@ class AggregatorViewModel(
     private val eventBus = MutableSharedFlow<ViewContract.Event>(extraBufferCapacity = 64)
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    init { scope.launch { eventBus.collect { onEvent(it) } } }
+    init {
+        scope.launch { eventBus.collect { onEvent(it) } }
+    }
 
-    fun sendEvent(event: ViewContract.Event) { scope.launch { eventBus.emit(event) } }
+    fun sendEvent(event: ViewContract.Event) {
+        scope.launch { eventBus.emit(event) }
+    }
 
-    fun consumeEffect(effect: ViewContract.Effect) { _effects.remove(effect) }
+    fun consumeEffect(effect: ViewContract.Effect) {
+        _effects.remove(effect)
+    }
 
     private fun onEvent(event: ViewContract.Event) {
         when (event) {
-            ViewContract.Event.PickFiles        -> _effects.add(ViewContract.Effect.OpenPickFilesDialog)
-            ViewContract.Event.PickFolder       -> _effects.add(ViewContract.Effect.OpenPickFolderDialog)
-            ViewContract.Event.BrowseOutput     -> _effects.add(ViewContract.Effect.OpenSaveDialog)
-            is ViewContract.Event.AddFiles      -> addFiles(event.files)
-            is ViewContract.Event.RemoveFile    -> removeFile(event.file)
-            is ViewContract.Event.DiagnoseFile  -> runDiagnose(event.file)
-            ViewContract.Event.ClearFiles       -> state = state.copy(selectedFiles = emptyList(), statusMessage = "")
-            is ViewContract.Event.SetOutputPath -> state = state.copy(outputPath = event.path)
-            ViewContract.Event.Process          -> startProcessing()
+            ViewContract.Event.PickFiles -> _effects.add(ViewContract.Effect.OpenPickFilesDialog)
+            ViewContract.Event.PickFolder -> _effects.add(ViewContract.Effect.OpenPickFolderDialog)
+            is ViewContract.Event.AddFiles -> addFiles(event.files)
+            is ViewContract.Event.RemoveFile -> removeFile(event.file)
+            is ViewContract.Event.DiagnoseFile -> runDiagnose(event.file)
+            ViewContract.Event.ClearFiles -> state = state.copy(selectedFiles = emptyList(), statusMessage = "")
+            ViewContract.Event.Process -> startProcessing()
         }
     }
 
     private fun addFiles(files: List<File>) {
         if (files.isEmpty()) return
         val merged = (state.selectedFiles + files).distinctBy { it.absolutePath }
-        state = state.copy(selectedFiles = merged, statusMessage = "เลือก ${merged.size} ไฟล์")
+        val outputFolder = merged.firstOrNull()?.parentFile?.absolutePath.orEmpty()
+        state = state.copy(
+            selectedFiles = merged,
+            statusMessage = if (outputFolder.isBlank()) {
+                "Selected ${merged.size} files"
+            } else {
+                "Selected ${merged.size} files. Output will be saved in $outputFolder"
+            }
+        )
     }
 
     private fun removeFile(file: File) {
         val remain = state.selectedFiles.filter { it != file }
-        state = state.copy(selectedFiles = remain, statusMessage = "เลือก ${remain.size} ไฟล์")
+        val outputFolder = remain.firstOrNull()?.parentFile?.absolutePath
+        state = state.copy(
+            selectedFiles = remain,
+            statusMessage = when {
+                remain.isEmpty() -> ""
+                outputFolder.isNullOrBlank() -> "Selected ${remain.size} files"
+                else -> "Selected ${remain.size} files. Output will be saved in $outputFolder"
+            }
+        )
     }
 
     private fun startProcessing() {
-        if (state.selectedFiles.isEmpty()) { state = state.copy(statusMessage = "⚠️ กรุณาเลือกไฟล์ก่อน"); return }
-        if (state.outputPath.isBlank())    { state = state.copy(statusMessage = "⚠️ กรุณาระบุชื่อไฟล์ผลลัพธ์"); return }
-        state = state.copy(isProcessing = true, statusMessage = "กำลังประมวลผล...")
+        if (state.selectedFiles.isEmpty()) {
+            state = state.copy(statusMessage = "Please select Excel files first")
+            return
+        }
+        state = state.copy(isProcessing = true, statusMessage = "Processing files...")
         _effects.add(ViewContract.Effect.StartProcessing)
     }
 
     suspend fun processFiles() {
         try {
             val result = withContext(Dispatchers.IO) {
-                aggregateInvoices.execute(state.selectedFiles, state.outputPath)
+                aggregateInvoices.execute(state.selectedFiles)
             }
             val status = buildStatusMessage.execute(result)
             state = state.copy(selectedFiles = emptyList(), isProcessing = false, statusMessage = status)
         } catch (e: Exception) {
-            state = state.copy(isProcessing = false, statusMessage = "❌ เกิดข้อผิดพลาด: ${e.message}")
+            state = state.copy(isProcessing = false, statusMessage = "Error: ${e.message}")
         }
     }
 

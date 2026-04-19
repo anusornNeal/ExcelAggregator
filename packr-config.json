@@ -1,0 +1,11 @@
+﻿{
+  "platform": "windows64",
+  "jdk": "C:\\Users\\tatar\\excel-jre",
+  "executable": "ExcelAggregator",
+  "classPath": ["build/libs/ExcelAggregator-1.0-SNAPSHOT-all.jar"],
+  "mainClass": "MainKt",
+  "vmArgs": ["-Xmx512m", "-Dfile.encoding=UTF-8"],
+  "resources": ["build/resources/main"],
+  "output": "build/packr",
+  "minimizejre": false
+}

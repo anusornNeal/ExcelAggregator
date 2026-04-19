@@ -14,7 +14,7 @@ import presentation.contract.ViewContract
 fun ProcessButton(state: ViewContract.State, sendEvent: (ViewContract.Event) -> Unit) {
     Button(
         onClick = { sendEvent(ViewContract.Event.Process) },
-        enabled = !state.isProcessing && state.selectedFiles.isNotEmpty() && state.outputPath.isNotBlank(),
+        enabled = !state.isProcessing && state.selectedFiles.isNotEmpty(),
         modifier = Modifier.fillMaxWidth().height(48.dp),
         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFA000))
     ) {

@@ -24,14 +24,13 @@ class AggregateInvoicesUseCase(
         val outFile: File?
     )
 
-    fun execute(selectedFiles: List<File>, outputPath: String): Result {
+    fun execute(selectedFiles: List<File>): Result {
         val (sheets, processedFiles, skipped) = parseFiles(selectedFiles)
 
         if (sheets.isEmpty()) return Result(processedFiles.size, skipped, null)
 
-        val outFile = resolveOutputFile(outputPath)
+        val outFile = resolveOutputFile(selectedFiles)
         writer.write(sheets, outFile)
-        processedFiles.forEach { it.delete() }
 
         return Result(processedFiles.size, skipped, outFile)
     }
@@ -53,8 +52,11 @@ class AggregateInvoicesUseCase(
         return Triple(sheets, processed, skipped)
     }
 
-    private fun resolveOutputFile(path: String): File =
-        File(path).let { if (it.extension.lowercase() !in listOf("xlsx", "xls")) File("$path.xlsx") else it }
+    private fun resolveOutputFile(files: List<File>): File {
+        val baseDir = files.firstOrNull()?.parentFile ?: File(".")
+        val time = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"))
+        return File(baseDir, "aggregated_invoices_$time.xlsx")
+    }
 }
 
 /** Generates a diagnostic report for a single file and writes it to disk. */
