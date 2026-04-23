@@ -30,12 +30,13 @@ class AggregationIntegrationTest {
         assertTrue(outputFile.exists(), "expected output workbook to be created")
 
         XSSFWorkbook(outputFile.inputStream()).use { workbook ->
-            assertEquals(1, workbook.numberOfSheets)
-            assertEquals("Accountant View", workbook.getSheetAt(0).sheetName)
+            assertEquals(2, workbook.numberOfSheets)
+            assertEquals("สรุปรวม (Summary)", workbook.getSheetAt(0).sheetName)
+            assertEquals("รายละเอียดราคา (Price Detail)", workbook.getSheetAt(1).sheetName)
 
-            val accountantView = workbook.getSheet("Accountant View")
-            assertTrue(accountantView.lastRowNum > 5, "accountant view should contain summary and grouped sections")
-            assertEquals("Combined Invoice Summary", accountantView.getRow(0).getCell(0).stringCellValue)
+            val summary = workbook.getSheet("สรุปรวม (Summary)")
+            assertTrue(summary.lastRowNum >= 5, "summary should contain one row per parsed sheet")
+            assertEquals("สรุปรวมใบส่งสินค้า Depart Counter - ทุกสาขา", summary.getRow(0).getCell(0).stringCellValue)
         }
     }
 }

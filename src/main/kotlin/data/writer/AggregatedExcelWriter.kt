@@ -1,9 +1,7 @@
 package data.writer
 
 import domain.model.SheetData
-import domain.model.formatGpPercentLabel
 import domain.model.getDetailRows
-import domain.model.getGpSummaryText
 import domain.model.getGpTotalValue
 import domain.model.getGpTotalsByPercent
 import domain.model.getTotalRow
@@ -18,164 +16,165 @@ import org.apache.poi.ss.util.CellRangeAddress
 import org.apache.poi.xssf.usermodel.XSSFWorkbook
 import java.io.File
 import java.io.FileOutputStream
-import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
+import kotlin.math.abs
 
-/** Writes aggregated SheetData into a single accountant-friendly workbook. */
+/** Writes aggregated invoice sheets into summary and price-detail workbook tabs. */
 object AggregatedExcelWriter {
-    private val generatedAtFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+    private const val SUMMARY_SHEET_NAME = "สรุปรวม (Summary)"
+    private const val DETAIL_SHEET_NAME = "รายละเอียดราคา (Price Detail)"
 
     fun write(sheets: List<SheetData>, outputFile: File) {
         require(sheets.isNotEmpty()) { "No sheets to aggregate" }
 
         XSSFWorkbook().use { wb ->
             val styles = Styles.create(wb)
-            writeAccountantView(wb.createSheet("Accountant View"), sheets, styles)
+            writeSummarySheet(wb.createSheet(SUMMARY_SHEET_NAME), sheets, styles)
+            writePriceDetailSheet(wb.createSheet(DETAIL_SHEET_NAME), sheets, styles)
             FileOutputStream(outputFile).use { wb.write(it) }
         }
     }
 
-    private fun writeAccountantView(ws: org.apache.poi.ss.usermodel.Sheet, sheets: List<SheetData>, styles: Styles) {
-        var rowIndex = 0
-        val summaryHeaders = listOf("File Name", "Sheet Name", "Branch", "Date", "Lines", "Total Qty", "Total Value", "Total GP")
+    private fun writeSummarySheet(ws: org.apache.poi.ss.usermodel.Sheet, sheets: List<SheetData>, styles: Styles) {
+        val headers = listOf(
+            "#",
+            "File Name",
+            "Sheet Name",
+            "สาขา",
+            "จำนวนรายการ",
+            "จำนวนตัว",
+            "มูลค่า (บาท)",
+            "GP Rate",
+            "GP (บาท)",
+            "หมายเหตุ"
+        )
         val grandQty = sheets.sumOf { it.getTotalRow()?.qty ?: 0.0 }
         val grandValue = sheets.sumOf { it.getTotalRow()?.value ?: 0.0 }
         val grandGp = sheets.sumOf { it.getGpTotalValue() ?: 0.0 }
-        val gpPercents = sheets
-            .flatMap { it.getGpTotalsByPercent().keys }
-            .distinct()
-            .sorted()
-        val grandGpByPercent = gpPercents.associateWith { percent ->
-            sheets.sumOf { it.getGpTotalsByPercent()[percent] ?: 0.0 }
-        }
 
-        ws.createRow(rowIndex++).apply {
-            createTextCell(0, "Combined Invoice Summary", styles.title)
+        ws.createRow(0).apply {
+            createTextCell(0, "สรุปรวมใบส่งสินค้า Depart Counter - ทุกสาขา", styles.title)
         }
-        ws.addMergedRegion(CellRangeAddress(0, 0, 0, maxOf(7, gpPercents.size * 2 - 1)))
+        ws.addMergedRegion(CellRangeAddress(0, 0, 0, headers.lastIndex))
 
-        ws.createRow(rowIndex++).apply {
-            createTextCell(0, "Generated", styles.metaLabel)
-            createTextCell(1, LocalDateTime.now().format(generatedAtFormatter), styles.metaValue)
-            createTextCell(4, "Invoice sheets", styles.metaLabel)
-            createNumberCell(5, sheets.size.toDouble(), styles.metaInteger)
+        ws.createRow(1).apply {
+            createTextCell(0, "รวม ${sheets.size} ชีท", styles.metaLabel)
+            createTextCell(1, "ข้อมูลจาก ${sheets.map { fileNameOf(it) }.distinct().size} ไฟล์", styles.metaValue)
         }
+        ws.addMergedRegion(CellRangeAddress(1, 1, 1, 3))
 
-        ws.createRow(rowIndex++).apply {
-            createTextCell(0, "Total quantity", styles.kpiLabel)
-            createNumberCell(1, grandQty, styles.kpiValue)
-            createTextCell(2, "Total value", styles.kpiLabel)
-            createNumberCell(3, grandValue, styles.kpiValue)
-            createTextCell(4, "Total GP", styles.kpiLabel)
-            createNumberCell(5, grandGp, styles.kpiValue)
-        }
+        writeHeaderRow(ws.createRow(3), headers, styles.header)
 
-        if (gpPercents.isNotEmpty()) {
-            ws.createRow(rowIndex++).apply {
-                var col = 0
-                gpPercents.forEach { percent ->
-                    createTextCell(col++, formatGpPercentLabel(percent), styles.kpiLabel)
-                    createNumberCell(col++, grandGpByPercent[percent] ?: 0.0, styles.kpiValue)
-                }
-            }
-        }
-
-        rowIndex++
-        ws.createRow(rowIndex++).apply {
-            createTextCell(0, "Sheet Summary", styles.sectionBanner)
-        }
-        ws.addMergedRegion(CellRangeAddress(rowIndex - 1, rowIndex - 1, 0, summaryHeaders.lastIndex))
-
-        writeHeaderRow(ws.createRow(rowIndex++), summaryHeaders, styles.header)
-        sheets.forEach { sheet ->
+        var rowIndex = 4
+        sheets.forEachIndexed { index, sheet ->
             val total = sheet.getTotalRow()
             ws.createRow(rowIndex++).apply {
-                createTextCell(0, sheet.sourceFileName.orEmpty(), styles.text)
-                createTextCell(1, sheet.sourceSheetName.orEmpty(), styles.text)
-                createTextCell(2, sheet.branch.ifBlank { "-" }, styles.text)
-                createTextCell(3, sheet.date.ifBlank { "-" }, styles.text)
+                createNumberCell(0, (index + 1).toDouble(), styles.integer)
+                createTextCell(1, fileNameOf(sheet), styles.fileText)
+                createTextCell(2, sheetNameOf(sheet), styles.text)
+                createTextCell(3, sheet.branch.ifBlank { "-" }, styles.text)
                 createNumberCell(4, sheet.getDetailRows().size.toDouble(), styles.integer)
-                createOptionalNumberCell(5, total?.qty, styles.number)
+                createOptionalNumberCell(5, total?.qty, styles.integer)
                 createOptionalNumberCell(6, total?.value, styles.number)
-                createOptionalNumberCell(7, sheet.getGpTotalValue(), styles.number)
+                createTextCell(7, gpRateText(sheet), styles.text)
+                createOptionalNumberCell(8, sheet.getGpTotalValue(), styles.number)
+                createTextCell(9, "", styles.text)
             }
         }
 
-        rowIndex += 2
-        ws.createRow(rowIndex++).apply {
-            createTextCell(0, "Details By File", styles.sectionBanner)
+        ws.createRow(rowIndex).apply {
+            createTextCell(0, "รวมทั้งหมด (Grand Total)", styles.grandLabel)
+            createOptionalNumberCell(5, grandQty, styles.grandInteger)
+            createOptionalNumberCell(6, grandValue, styles.grandNumber)
+            createOptionalNumberCell(8, grandGp, styles.grandNumber)
         }
-        ws.addMergedRegion(CellRangeAddress(rowIndex - 1, rowIndex - 1, 0, 7))
+        ws.addMergedRegion(CellRangeAddress(rowIndex, rowIndex, 0, 4))
 
-        sheets.groupBy { it.sourceFileName.orEmpty() }.forEach { (fileName, fileSheets) ->
+        ws.createFreezePane(0, 4)
+        setColumnWidths(ws, listOf(6, 28, 24, 30, 14, 14, 16, 14, 16, 18))
+    }
+
+    private fun writePriceDetailSheet(ws: org.apache.poi.ss.usermodel.Sheet, sheets: List<SheetData>, styles: Styles) {
+        val headers = listOf(
+            "File Name",
+            "Sheet Name",
+            "สาขา",
+            "ราคา (บาท)",
+            "จำนวนตัว",
+            "มูลค่า (บาท)",
+            "GP Rate",
+            "GP (บาท)"
+        )
+        val grandQty = sheets.sumOf { it.getTotalRow()?.qty ?: 0.0 }
+        val grandValue = sheets.sumOf { it.getTotalRow()?.value ?: 0.0 }
+        val grandGp = sheets.sumOf { it.getGpTotalValue() ?: 0.0 }
+
+        ws.createRow(0).apply {
+            createTextCell(0, "ตารางรายละเอียดราคาแยกตามสาขา", styles.title)
+        }
+        ws.addMergedRegion(CellRangeAddress(0, 0, 0, headers.lastIndex))
+
+        writeHeaderRow(ws.createRow(2), headers, styles.header)
+
+        var rowIndex = 3
+        sheets.groupBy(::fileNameOf).entries.forEachIndexed { fileIndex, (fileName, fileSheets) ->
+            val rowStyles = styles.groupStyles[fileIndex % styles.groupStyles.size]
             val fileQty = fileSheets.sumOf { it.getTotalRow()?.qty ?: 0.0 }
             val fileValue = fileSheets.sumOf { it.getTotalRow()?.value ?: 0.0 }
             val fileGp = fileSheets.sumOf { it.getGpTotalValue() ?: 0.0 }
 
-            ws.createRow(rowIndex++).apply {
-                createTextCell(0, fileName.ifBlank { "(Unnamed file)" }, styles.fileBanner)
-                createTextCell(4, "Qty", styles.fileBanner)
-                createNumberCell(5, fileQty, styles.fileBannerNumber)
-                createTextCell(6, "Value / GP", styles.fileBanner)
-                createTextCell(7, formatMoneyPair(fileValue, fileGp), styles.fileBanner)
+            ws.createRow(rowIndex).apply {
+                createTextCell(0, fileName, rowStyles.fileHeader)
+                createTextCell(1, "", rowStyles.fileHeader)
+                createTextCell(2, "", rowStyles.fileHeader)
+                createTextCell(3, "File Total", rowStyles.fileHeader)
+                createOptionalNumberCell(4, fileQty, rowStyles.fileHeaderInteger)
+                createOptionalNumberCell(5, fileValue, rowStyles.fileHeaderNumber)
+                createTextCell(6, "${fileSheets.size} sheets", rowStyles.fileHeader)
+                createOptionalNumberCell(7, fileGp, rowStyles.fileHeaderNumber)
             }
+            ws.addMergedRegion(CellRangeAddress(rowIndex, rowIndex, 0, 2))
+            rowIndex++
 
             fileSheets.forEach { sheet ->
-                ws.createRow(rowIndex++).apply {
-                    createTextCell(0, "Sheet", styles.label)
-                    createTextCell(1, sheet.sourceSheetName.orEmpty(), styles.text)
-                    createTextCell(2, "Branch", styles.label)
-                    createTextCell(3, sheet.branch.ifBlank { "-" }, styles.text)
-                    createTextCell(4, "Date", styles.label)
-                    createTextCell(5, sheet.date.ifBlank { "-" }, styles.text)
-                    createTextCell(6, "Total GP", styles.label)
-                    createOptionalNumberCell(7, sheet.getGpTotalValue(), styles.number)
-                }
-
-                sheet.getGpTotalsByPercent().toSortedMap().forEach { (percent, value) ->
+                val detailRows = sheet.getDetailRows()
+                detailRows.forEachIndexed { detailIndex, detail ->
+                    val showGroupInfo = detailIndex == 0
                     ws.createRow(rowIndex++).apply {
-                        createTextCell(6, formatGpPercentLabel(percent), styles.label)
-                        createNumberCell(7, value, styles.number)
+                        createTextCell(0, if (showGroupInfo) fileNameOf(sheet) else "", rowStyles.fileText)
+                        createTextCell(1, if (showGroupInfo) sheetNameOf(sheet) else "", rowStyles.text)
+                        createTextCell(2, if (showGroupInfo) sheet.branch.ifBlank { "-" } else "", rowStyles.text)
+                        createOptionalNumberCell(3, detail.price, rowStyles.number)
+                        createOptionalNumberCell(4, detail.qty, rowStyles.integer)
+                        createOptionalNumberCell(5, detail.value, rowStyles.number)
+                        createTextCell(6, "", rowStyles.text)
+                        createTextCell(7, "", rowStyles.number)
                     }
                 }
 
-                writeHeaderRow(ws.createRow(rowIndex++), listOf("Price", "Quantity", "Value"), styles.header)
-                sheet.getDetailRows().forEach { detail ->
-                    ws.createRow(rowIndex++).apply {
-                        createOptionalNumberCell(0, detail.price, styles.number)
-                        createOptionalNumberCell(1, detail.qty, styles.number)
-                        createOptionalNumberCell(2, detail.value, styles.number)
-                    }
+                val total = sheet.getTotalRow()
+                ws.createRow(rowIndex).apply {
+                    createTextCell(0, "รวม : ${sheetNameOf(sheet)}", rowStyles.sheetTotalLabel)
+                    createOptionalNumberCell(4, total?.qty, rowStyles.sheetTotalInteger)
+                    createOptionalNumberCell(5, total?.value, rowStyles.sheetTotalNumber)
+                    createTextCell(6, gpRateText(sheet), rowStyles.sheetTotalLabel)
+                    createOptionalNumberCell(7, sheet.getGpTotalValue(), rowStyles.sheetTotalNumber)
                 }
-
-                sheet.getTotalRow()?.let { total ->
-                    ws.createRow(rowIndex++).apply {
-                        createTextCell(0, "Sheet Total", styles.totalLabel)
-                        createOptionalNumberCell(1, total.qty, styles.totalNumber)
-                        createOptionalNumberCell(2, total.value, styles.totalNumber)
-                    }
-                }
-
-                sheet.getGpTotalValue()?.let { gp ->
-                    ws.createRow(rowIndex++).apply {
-                        createTextCell(0, "Sheet GP", styles.totalLabel)
-                        createNumberCell(2, gp, styles.totalNumber)
-                    }
-                }
-
+                ws.addMergedRegion(CellRangeAddress(rowIndex, rowIndex, 0, 3))
                 rowIndex++
             }
         }
 
-        ws.createFreezePane(0, 6)
-        setColumnWidths(ws, listOf(28, 24, 22, 14, 12, 14, 14, 20))
+        ws.createRow(rowIndex).apply {
+            createTextCell(0, "GRAND TOTAL - ทุกสาขา", styles.grandLabel)
+            createOptionalNumberCell(4, grandQty, styles.grandInteger)
+            createOptionalNumberCell(5, grandValue, styles.grandNumber)
+            createOptionalNumberCell(7, grandGp, styles.grandNumber)
+        }
+        ws.addMergedRegion(CellRangeAddress(rowIndex, rowIndex, 0, 3))
+
+        ws.createFreezePane(0, 3)
+        setColumnWidths(ws, listOf(28, 24, 32, 14, 14, 16, 14, 16))
     }
-
-    private fun formatMoneyPair(value: Double, gp: Double): String =
-        "${formatNumber(value)} / ${formatNumber(gp)}"
-
-    private fun formatNumber(value: Double): String =
-        "%,.2f".format(value)
 
     private fun writeHeaderRow(row: org.apache.poi.ss.usermodel.Row, values: List<String>, style: CellStyle) {
         values.forEachIndexed { index, value -> row.createTextCell(index, value, style) }
@@ -183,6 +182,25 @@ object AggregatedExcelWriter {
 
     private fun setColumnWidths(ws: org.apache.poi.ss.usermodel.Sheet, widths: List<Int>) {
         widths.forEachIndexed { index, width -> ws.setColumnWidth(index, width * 256) }
+    }
+
+    private fun fileNameOf(sheet: SheetData): String =
+        sheet.sourceFileName?.takeIf { it.isNotBlank() } ?: "-"
+
+    private fun sheetNameOf(sheet: SheetData): String =
+        sheet.sourceSheetName?.takeIf { it.isNotBlank() } ?: "-"
+
+    private fun gpRateText(sheet: SheetData): String =
+        sheet.getGpTotalsByPercent().keys
+            .sorted()
+            .map(::formatPercent)
+            .ifEmpty { listOf("-") }
+            .joinToString(", ")
+
+    private fun formatPercent(value: Double): String {
+        val displayValue = if (abs(value) <= 1.0) value * 100 else value
+        val formatted = if (displayValue % 1.0 == 0.0) displayValue.toLong().toString() else displayValue.toString()
+        return "$formatted%"
     }
 
     private fun org.apache.poi.ss.usermodel.Row.createTextCell(column: Int, value: String, style: CellStyle): Cell =
@@ -203,23 +221,35 @@ object AggregatedExcelWriter {
             cellStyle = style
         }
 
+    private data class GroupStyles(
+        val fileHeader: CellStyle,
+        val fileHeaderNumber: CellStyle,
+        val fileHeaderInteger: CellStyle,
+        val fileText: CellStyle,
+        val text: CellStyle,
+        val number: CellStyle,
+        val integer: CellStyle,
+        val sheetTotalLabel: CellStyle,
+        val sheetTotalNumber: CellStyle,
+        val sheetTotalInteger: CellStyle
+    )
+
     private data class Styles(
         val title: CellStyle,
         val metaLabel: CellStyle,
         val metaValue: CellStyle,
-        val metaInteger: CellStyle,
-        val kpiLabel: CellStyle,
-        val kpiValue: CellStyle,
-        val sectionBanner: CellStyle,
-        val fileBanner: CellStyle,
-        val fileBannerNumber: CellStyle,
         val header: CellStyle,
-        val label: CellStyle,
+        val fileText: CellStyle,
         val text: CellStyle,
         val number: CellStyle,
         val integer: CellStyle,
         val totalLabel: CellStyle,
-        val totalNumber: CellStyle
+        val totalNumber: CellStyle,
+        val totalInteger: CellStyle,
+        val grandLabel: CellStyle,
+        val grandNumber: CellStyle,
+        val grandInteger: CellStyle,
+        val groupStyles: List<GroupStyles>
     ) {
         companion object {
             fun create(wb: XSSFWorkbook): Styles {
@@ -233,7 +263,6 @@ object AggregatedExcelWriter {
                     bold = true
                     color = IndexedColors.WHITE.index
                 }
-
                 val decimalFormat = wb.creationHelper.createDataFormat().getFormat("#,##0.00")
                 val integerFormat = wb.creationHelper.createDataFormat().getFormat("#,##0")
 
@@ -245,6 +274,30 @@ object AggregatedExcelWriter {
                     borderRight = BorderStyle.THIN
                 }
 
+                fun filled(fill: IndexedColors, dataFormat: Short? = null): CellStyle =
+                    bordered().apply {
+                        alignment = HorizontalAlignment.LEFT
+                        wrapText = true
+                        fillForegroundColor = fill.index
+                        fillPattern = FillPatternType.SOLID_FOREGROUND
+                        dataFormat?.let { this.dataFormat = it }
+                    }
+
+                fun filledNumber(fill: IndexedColors, format: Short): CellStyle =
+                    filled(fill, format).apply {
+                        alignment = HorizontalAlignment.RIGHT
+                    }
+
+                fun filledBold(fill: IndexedColors, dataFormat: Short? = null): CellStyle =
+                    filled(fill, dataFormat).apply {
+                        setFont(boldFont)
+                    }
+
+                fun filledBoldNumber(fill: IndexedColors, format: Short): CellStyle =
+                    filledBold(fill, format).apply {
+                        alignment = HorizontalAlignment.RIGHT
+                    }
+
                 val title = bordered().apply {
                     setFont(titleFont)
                     alignment = HorizontalAlignment.CENTER
@@ -253,60 +306,28 @@ object AggregatedExcelWriter {
                 }
                 val metaLabel = bordered().apply {
                     setFont(boldFont)
-                    fillForegroundColor = IndexedColors.GREY_25_PERCENT.index
+                    alignment = HorizontalAlignment.CENTER
+                    fillForegroundColor = IndexedColors.LIGHT_TURQUOISE.index
                     fillPattern = FillPatternType.SOLID_FOREGROUND
                 }
                 val metaValue = bordered().apply {
                     alignment = HorizontalAlignment.LEFT
-                }
-                val metaInteger = bordered().apply {
-                    alignment = HorizontalAlignment.RIGHT
-                    dataFormat = integerFormat
-                }
-                val kpiLabel = bordered().apply {
-                    setFont(boldFont)
                     fillForegroundColor = IndexedColors.LIGHT_TURQUOISE.index
-                    fillPattern = FillPatternType.SOLID_FOREGROUND
-                }
-                val kpiValue = bordered().apply {
-                    setFont(boldFont)
-                    alignment = HorizontalAlignment.RIGHT
-                    dataFormat = decimalFormat
-                    fillForegroundColor = IndexedColors.LIGHT_TURQUOISE.index
-                    fillPattern = FillPatternType.SOLID_FOREGROUND
-                }
-                val sectionBanner = bordered().apply {
-                    setFont(whiteBoldFont)
-                    fillForegroundColor = IndexedColors.TEAL.index
-                    fillPattern = FillPatternType.SOLID_FOREGROUND
-                }
-                val fileBanner = bordered().apply {
-                    setFont(whiteBoldFont)
-                    fillForegroundColor = IndexedColors.BLUE_GREY.index
-                    fillPattern = FillPatternType.SOLID_FOREGROUND
-                }
-                val fileBannerNumber = bordered().apply {
-                    setFont(whiteBoldFont)
-                    alignment = HorizontalAlignment.RIGHT
-                    dataFormat = decimalFormat
-                    fillForegroundColor = IndexedColors.BLUE_GREY.index
                     fillPattern = FillPatternType.SOLID_FOREGROUND
                 }
                 val header = bordered().apply {
-                    setFont(boldFont)
+                    setFont(whiteBoldFont)
                     alignment = HorizontalAlignment.CENTER
-                    fillForegroundColor = IndexedColors.GREY_40_PERCENT.index
-                    fillPattern = FillPatternType.SOLID_FOREGROUND
-                }
-                val label = bordered().apply {
-                    setFont(boldFont)
-                    alignment = HorizontalAlignment.RIGHT
-                    fillForegroundColor = IndexedColors.LEMON_CHIFFON.index
+                    fillForegroundColor = IndexedColors.BLUE.index
                     fillPattern = FillPatternType.SOLID_FOREGROUND
                 }
                 val text = bordered().apply {
                     alignment = HorizontalAlignment.LEFT
                     wrapText = true
+                }
+                val fileText = bordered().apply {
+                    alignment = HorizontalAlignment.LEFT
+                    wrapText = false
                 }
                 val number = bordered().apply {
                     alignment = HorizontalAlignment.RIGHT
@@ -318,34 +339,76 @@ object AggregatedExcelWriter {
                 }
                 val totalLabel = bordered().apply {
                     setFont(boldFont)
-                    fillForegroundColor = IndexedColors.LIGHT_CORNFLOWER_BLUE.index
+                    fillForegroundColor = IndexedColors.LIGHT_GREEN.index
                     fillPattern = FillPatternType.SOLID_FOREGROUND
                 }
                 val totalNumber = bordered().apply {
                     setFont(boldFont)
                     alignment = HorizontalAlignment.RIGHT
                     dataFormat = decimalFormat
-                    fillForegroundColor = IndexedColors.LIGHT_CORNFLOWER_BLUE.index
+                    fillForegroundColor = IndexedColors.LIGHT_GREEN.index
                     fillPattern = FillPatternType.SOLID_FOREGROUND
+                }
+                val totalInteger = bordered().apply {
+                    setFont(boldFont)
+                    alignment = HorizontalAlignment.RIGHT
+                    dataFormat = integerFormat
+                    fillForegroundColor = IndexedColors.LIGHT_GREEN.index
+                    fillPattern = FillPatternType.SOLID_FOREGROUND
+                }
+                val grandLabel = bordered().apply {
+                    setFont(whiteBoldFont)
+                    fillForegroundColor = IndexedColors.DARK_BLUE.index
+                    fillPattern = FillPatternType.SOLID_FOREGROUND
+                }
+                val grandNumber = bordered().apply {
+                    setFont(whiteBoldFont)
+                    alignment = HorizontalAlignment.RIGHT
+                    dataFormat = decimalFormat
+                    fillForegroundColor = IndexedColors.DARK_BLUE.index
+                    fillPattern = FillPatternType.SOLID_FOREGROUND
+                }
+                val grandInteger = bordered().apply {
+                    setFont(whiteBoldFont)
+                    alignment = HorizontalAlignment.RIGHT
+                    dataFormat = integerFormat
+                    fillForegroundColor = IndexedColors.DARK_BLUE.index
+                    fillPattern = FillPatternType.SOLID_FOREGROUND
+                }
+                val groupFills = listOf(IndexedColors.WHITE)
+                val groupStyles = groupFills.map { fill ->
+                    GroupStyles(
+                        fileHeader = filledBold(IndexedColors.GREY_25_PERCENT).apply {
+                            wrapText = false
+                        },
+                        fileHeaderNumber = filledBoldNumber(IndexedColors.GREY_25_PERCENT, decimalFormat),
+                        fileHeaderInteger = filledBoldNumber(IndexedColors.GREY_25_PERCENT, integerFormat),
+                        fileText = filled(fill).apply { wrapText = false },
+                        text = filled(fill),
+                        number = filledNumber(fill, decimalFormat),
+                        integer = filledNumber(fill, integerFormat),
+                        sheetTotalLabel = filledBold(fill),
+                        sheetTotalNumber = filledBoldNumber(fill, decimalFormat),
+                        sheetTotalInteger = filledBoldNumber(fill, integerFormat)
+                    )
                 }
 
                 return Styles(
-                    title,
-                    metaLabel,
-                    metaValue,
-                    metaInteger,
-                    kpiLabel,
-                    kpiValue,
-                    sectionBanner,
-                    fileBanner,
-                    fileBannerNumber,
-                    header,
-                    label,
-                    text,
-                    number,
-                    integer,
-                    totalLabel,
-                    totalNumber
+                    title = title,
+                    metaLabel = metaLabel,
+                    metaValue = metaValue,
+                    header = header,
+                    fileText = fileText,
+                    text = text,
+                    number = number,
+                    integer = integer,
+                    totalLabel = totalLabel,
+                    totalNumber = totalNumber,
+                    totalInteger = totalInteger,
+                    grandLabel = grandLabel,
+                    grandNumber = grandNumber,
+                    grandInteger = grandInteger,
+                    groupStyles = groupStyles
                 )
             }
         }

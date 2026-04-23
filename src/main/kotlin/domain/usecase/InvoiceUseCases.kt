@@ -1,6 +1,5 @@
 package domain.usecase
 
-import data.config.ConfigLoader
 import data.reader.InvoiceExcelReader
 import domain.model.SheetData
 import java.io.File
@@ -12,16 +11,26 @@ fun interface InvoiceWriter {
     fun write(sheets: List<SheetData>, outputFile: File)
 }
 
-/** Orchestrates reading, aggregating, and writing invoice Excel files. */
+/** Port: anything that can read invoice sheets from a file. Implemented in data layer. */
+interface InvoiceReader {
+    fun readAll(file: File): List<SheetData>
+    fun diagnose(file: File): String
+}
+
+/** Orchestrates reading, aggregating, writing, and cleanup for invoice Excel files. */
 class AggregateInvoicesUseCase(
-    private val reader: InvoiceExcelReader = InvoiceExcelReader,
-    private val writer: InvoiceWriter = InvoiceWriter { sheets, file -> data.writer.AggregatedExcelWriter.write(sheets, file) },
-    private val configLoader: ConfigLoader = ConfigLoader
+    private val reader: InvoiceReader = object : InvoiceReader {
+        override fun readAll(file: File): List<SheetData> = InvoiceExcelReader.readAll(file)
+        override fun diagnose(file: File): String = InvoiceExcelReader.diagnose(file)
+    },
+    private val writer: InvoiceWriter = InvoiceWriter { sheets, file -> data.writer.AggregatedExcelWriter.write(sheets, file) }
 ) {
     data class Result(
         val processedCount: Int,
         val skipped: List<Pair<File, String>>,
-        val outFile: File?
+        val outFile: File?,
+        val deletedCount: Int = 0,
+        val deleteFailures: List<Pair<File, String>> = emptyList()
     )
 
     fun execute(selectedFiles: List<File>): Result {
@@ -31,8 +40,15 @@ class AggregateInvoicesUseCase(
 
         val outFile = resolveOutputFile(selectedFiles)
         writer.write(sheets, outFile)
+        val deleteFailures = deleteProcessedFiles(processedFiles, outFile)
 
-        return Result(processedFiles.size, skipped, outFile)
+        return Result(
+            processedCount = processedFiles.size,
+            skipped = skipped,
+            outFile = outFile,
+            deletedCount = processedFiles.size - deleteFailures.size,
+            deleteFailures = deleteFailures
+        )
     }
 
     private fun parseFiles(files: List<File>): Triple<List<SheetData>, List<File>, List<Pair<File, String>>> {
@@ -43,14 +59,27 @@ class AggregateInvoicesUseCase(
         for (file in files) {
             runCatching { reader.readAll(file) }
                 .onSuccess { fileSheets ->
-                    if (fileSheets.isNotEmpty()) { sheets.addAll(fileSheets); processed.add(file) }
-                    else skipped.add(file to runCatching { reader.diagnose(file) }.getOrElse { "diagnose failed: ${it.message}" })
+                    if (fileSheets.isNotEmpty()) {
+                        sheets.addAll(fileSheets)
+                        processed.add(file)
+                    } else {
+                        skipped.add(file to runCatching { reader.diagnose(file) }.getOrElse { "diagnose failed: ${it.message}" })
+                    }
                 }
                 .onFailure { skipped.add(file to "อ่านไฟล์ไม่สำเร็จ: ${it.message}") }
         }
 
         return Triple(sheets, processed, skipped)
     }
+
+    private fun deleteProcessedFiles(files: List<File>, outFile: File): List<Pair<File, String>> =
+        files
+            .filterNot { it.absoluteFile == outFile.absoluteFile }
+            .mapNotNull { file ->
+                runCatching {
+                    if (!file.exists() || file.delete()) null else file to "delete returned false"
+                }.getOrElse { file to (it.message ?: it::class.simpleName.orEmpty()) }
+            }
 
     private fun resolveOutputFile(files: List<File>): File {
         val baseDir = files.firstOrNull()?.parentFile ?: File(".")
@@ -67,8 +96,8 @@ class DiagnoseFileUseCase(
 
     fun execute(file: File): Result {
         val content = runCatching { reader.diagnose(file) }.getOrElse { "Failed to diagnose: ${it.message}" }
-        val time    = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"))
-        val report  = File(File(".").absoluteFile, "diagnose_${file.name}_$time.txt")
+        val time = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"))
+        val report = File(File(".").absoluteFile, "diagnose_${file.name}_$time.txt")
         report.writeText(content)
         return Result(report.absolutePath, content)
     }
@@ -80,28 +109,20 @@ class BuildStatusMessageUseCase {
         val outFile = result.outFile ?: return buildNoDataMessage(result.skipped)
         return buildString {
             appendLine("✅ รวม ${result.processedCount} ไฟล์สำเร็จ → ${outFile.name}")
-            appendLine("ลบไฟล์ต้นฉบับ ${result.processedCount} ไฟล์แล้ว")
+            appendLine("ลบไฟล์ต้นฉบับ ${result.deletedCount} ไฟล์แล้ว")
+            if (result.deleteFailures.isNotEmpty()) {
+                appendLine("ลบไฟล์ต้นฉบับไม่สำเร็จ ${result.deleteFailures.size} ไฟล์:")
+                result.deleteFailures.take(10).forEach { appendLine(" - ${it.first.name}: ${it.second}") }
+                if (result.deleteFailures.size > 10) appendLine(" (แสดง 10 รายการแรก)")
+            }
             if (result.skipped.isNotEmpty()) {
                 appendLine("ข้ามไฟล์ที่ไม่มีข้อมูล ${result.skipped.size} ไฟล์:")
                 result.skipped.take(10).forEach { appendLine(" - ${it.first.name}: ${it.second}") }
                 if (result.skipped.size > 10) appendLine(" (แสดง 10 รายการแรก)")
-                append(writeSkippedReport(outFile, result.skipped))
             }
         }
     }
 
     private fun buildNoDataMessage(skipped: List<Pair<File, String>>): String =
         "⚠️ ไม่พบข้อมูลที่ต้องการในไฟล์ที่เลือก\n${skipped.joinToString("; ") { "${it.first.name}: ${it.second}" }}"
-
-    private fun writeSkippedReport(outFile: File, skipped: List<Pair<File, String>>): String =
-        runCatching {
-            val time   = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"))
-            val report = File(outFile.parentFile ?: File("."), "skipped_report_$time.txt")
-            report.writeText(buildString {
-                appendLine("Skipped files report"); appendLine("Generated: ${ZonedDateTime.now()}")
-                appendLine("Output: ${outFile.absolutePath}\n")
-                skipped.forEach { appendLine("${it.first.absolutePath} -> ${it.second}") }
-            })
-            "รายงานไฟล์ที่ข้ามบันทึกที่: ${report.absolutePath}\n"
-        }.getOrElse { "ไม่สามารถบันทึกรายงานไฟล์ที่ข้าม: ${it.message}\n" }
 }

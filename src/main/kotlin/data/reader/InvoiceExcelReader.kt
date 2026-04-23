@@ -65,7 +65,7 @@ object InvoiceExcelReader {
         if (!isValidInvoiceSheet(sheet, config)) return null
         val (date, branch) = parseDateAndBranch(sheet, config)
         val (headerRowIndex, columns) = detectHeaderAndColumns(sheet, config) ?: return null
-        if (date.isBlank() || branch.isBlank()) return null
+        if (branch.isBlank()) return null
         val rows = parseDataRows(sheet, headerRowIndex, columns, config)
         return rows.takeIf { it.isNotEmpty() }
             ?.let { SheetData(date = date, branch = branch, rows = it, sourceFileName = fileName, sourceSheetIndex = index, sourceSheetName = sheet.sheetName) }
@@ -282,7 +282,7 @@ object InvoiceExcelReader {
         if (!titleFound) return false
 
         val (date, branch) = parseDateAndBranch(sheet, config)
-        if (date.isBlank() || branch.isBlank()) return false
+        if (branch.isBlank()) return false
 
         return detectHeaderAndColumns(sheet, config) != null
     }
