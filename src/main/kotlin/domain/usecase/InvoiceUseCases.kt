@@ -17,7 +17,7 @@ interface InvoiceReader {
     fun diagnose(file: File): String
 }
 
-/** Orchestrates reading, aggregating, writing, and cleanup for invoice Excel files. */
+/** Orchestrates reading, aggregating, and writing invoice Excel files. */
 class AggregateInvoicesUseCase(
     private val reader: InvoiceReader = object : InvoiceReader {
         override fun readAll(file: File): List<SheetData> = InvoiceExcelReader.readAll(file)
@@ -28,9 +28,7 @@ class AggregateInvoicesUseCase(
     data class Result(
         val processedCount: Int,
         val skipped: List<Pair<File, String>>,
-        val outFile: File?,
-        val deletedCount: Int = 0,
-        val deleteFailures: List<Pair<File, String>> = emptyList()
+        val outFile: File?
     )
 
     fun execute(selectedFiles: List<File>): Result {
@@ -40,14 +38,11 @@ class AggregateInvoicesUseCase(
 
         val outFile = resolveOutputFile(selectedFiles)
         writer.write(sheets, outFile)
-        val deleteFailures = deleteProcessedFiles(processedFiles, outFile)
 
         return Result(
             processedCount = processedFiles.size,
             skipped = skipped,
-            outFile = outFile,
-            deletedCount = processedFiles.size - deleteFailures.size,
-            deleteFailures = deleteFailures
+            outFile = outFile
         )
     }
 
@@ -71,15 +66,6 @@ class AggregateInvoicesUseCase(
 
         return Triple(sheets, processed, skipped)
     }
-
-    private fun deleteProcessedFiles(files: List<File>, outFile: File): List<Pair<File, String>> =
-        files
-            .filterNot { it.absoluteFile == outFile.absoluteFile }
-            .mapNotNull { file ->
-                runCatching {
-                    if (!file.exists() || file.delete()) null else file to "delete returned false"
-                }.getOrElse { file to (it.message ?: it::class.simpleName.orEmpty()) }
-            }
 
     private fun resolveOutputFile(files: List<File>): File {
         val baseDir = files.firstOrNull()?.parentFile ?: File(".")
@@ -108,13 +94,7 @@ class BuildStatusMessageUseCase {
     fun execute(result: AggregateInvoicesUseCase.Result): String {
         val outFile = result.outFile ?: return buildNoDataMessage(result.skipped)
         return buildString {
-            appendLine("✅ รวม ${result.processedCount} ไฟล์สำเร็จ → ${outFile.name}")
-            appendLine("ลบไฟล์ต้นฉบับ ${result.deletedCount} ไฟล์แล้ว")
-            if (result.deleteFailures.isNotEmpty()) {
-                appendLine("ลบไฟล์ต้นฉบับไม่สำเร็จ ${result.deleteFailures.size} ไฟล์:")
-                result.deleteFailures.take(10).forEach { appendLine(" - ${it.first.name}: ${it.second}") }
-                if (result.deleteFailures.size > 10) appendLine(" (แสดง 10 รายการแรก)")
-            }
+            appendLine("รวม ${result.processedCount} ไฟล์สำเร็จ -> ${outFile.name}")
             if (result.skipped.isNotEmpty()) {
                 appendLine("ข้ามไฟล์ที่ไม่มีข้อมูล ${result.skipped.size} ไฟล์:")
                 result.skipped.take(10).forEach { appendLine(" - ${it.first.name}: ${it.second}") }
@@ -124,5 +104,5 @@ class BuildStatusMessageUseCase {
     }
 
     private fun buildNoDataMessage(skipped: List<Pair<File, String>>): String =
-        "⚠️ ไม่พบข้อมูลที่ต้องการในไฟล์ที่เลือก\n${skipped.joinToString("; ") { "${it.first.name}: ${it.second}" }}"
+        "ไม่พบข้อมูลที่ต้องการในไฟล์ที่เลือก\n${skipped.joinToString("; ") { "${it.first.name}: ${it.second}" }}"
 }

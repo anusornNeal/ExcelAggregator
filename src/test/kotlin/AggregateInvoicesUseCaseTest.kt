@@ -8,14 +8,13 @@ import java.io.File
 import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class AggregateInvoicesUseCaseTest {
 
     @Test
-    fun deletesOnlyFilesThatWereAggregated() {
+    fun keepsOriginalFilesAfterAggregation() {
         val dir = createTempDirectory(prefix = "aggregate-cleanup-").toFile()
         val processedFile = File(dir, "processed.xlsx").apply { writeText("processed") }
         val skippedFile = File(dir, "skipped.xlsx").apply { writeText("skipped") }
@@ -34,10 +33,8 @@ class AggregateInvoicesUseCaseTest {
 
         assertNotNull(result.outFile)
         assertEquals(1, result.processedCount)
-        assertEquals(1, result.deletedCount)
-        assertTrue(result.deleteFailures.isEmpty())
         assertEquals(listOf(skippedFile), result.skipped.map { it.first })
-        assertFalse(processedFile.exists())
+        assertTrue(processedFile.exists())
         assertTrue(skippedFile.exists())
         assertTrue(result.outFile.exists())
     }
@@ -50,8 +47,7 @@ class AggregateInvoicesUseCaseTest {
         val result = AggregateInvoicesUseCase.Result(
             processedCount = 1,
             skipped = listOf(skippedFile to "no invoice data"),
-            outFile = outFile,
-            deletedCount = 1
+            outFile = outFile
         )
 
         val message = BuildStatusMessageUseCase().execute(result)
