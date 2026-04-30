@@ -62,13 +62,15 @@ object InvoiceExcelReader {
     // -------------------------------------------------------------------------
 
     private fun parseSheet(sheet: Sheet, index: Int, fileName: String, config: ReaderConfig): SheetData? {
-        if (!isValidInvoiceSheet(sheet, config)) return null
+        if (!hasDocumentTitle(sheet, config)) return null
         val (date, branch) = parseDateAndBranch(sheet, config)
-        val (headerRowIndex, columns) = detectHeaderAndColumns(sheet, config) ?: return null
-        if (branch.isBlank()) return null
-        val rows = parseDataRows(sheet, headerRowIndex, columns, config)
+        val outputBranch = branch.ifBlank { sheet.sheetName }
+        val rows = detectPivotSummary(sheet)
+            ?.let { parsePivotSummaryRows(sheet, it) }
+            ?.takeIf { it.isNotEmpty() }
+            ?: return null
         return rows.takeIf { it.isNotEmpty() }
-            ?.let { SheetData(date = date, branch = branch, rows = it, sourceFileName = fileName, sourceSheetIndex = index, sourceSheetName = sheet.sheetName) }
+            ?.let { SheetData(date = date, branch = outputBranch, rows = it, sourceFileName = fileName, sourceSheetIndex = index, sourceSheetName = sheet.sheetName) }
     }
 
     // -------------------------------------------------------------------------
@@ -271,21 +273,91 @@ object InvoiceExcelReader {
         return rows
     }
 
-    private fun isValidInvoiceSheet(sheet: Sheet, config: ReaderConfig): Boolean {
-        val titleFound = (0..minOf(sheet.lastRowNum, 12)).any { rowIndex ->
+    private data class PivotMapping(val headerRowIndex: Int, val price: Int, val qty: Int, val value: Int?)
+
+    private fun detectPivotSummary(sheet: Sheet): PivotMapping? {
+        for (row in sheet) {
+            val priceCell = row.firstOrNull { cell -> isSummaryPriceHeader(CellUtils.getCellString(cell)) }
+                ?: continue
+            val priceCol = priceCell.columnIndex
+            val lastCol = row.lastCellNum.toInt().coerceAtLeast(priceCol + 1)
+            val qtyCol = ((priceCol + 1) until lastCol).firstOrNull { col ->
+                val text = normalize(CellUtils.getCellString(row.getCell(col))).lowercase()
+                text.contains("amount") || text.contains("pieces") || text.contains("qty") || text.contains("จำนวน")
+            } ?: (priceCol + 1).takeIf { it < lastCol }
+            val valueCol = qtyCol?.let { qty ->
+                ((qty + 1) until lastCol).firstOrNull { col ->
+                    val text = normalize(CellUtils.getCellString(row.getCell(col))).lowercase()
+                    text.contains("มูลค่า") || text.contains("value") || text.contains("shop") || text.contains("total")
+                } ?: (qty + 1).takeIf { it < lastCol }
+            }
+
+            if (qtyCol != null) return PivotMapping(row.rowNum, priceCol, qtyCol, valueCol)
+        }
+        return null
+    }
+
+    private fun isSummaryPriceHeader(raw: String): Boolean {
+        val text = normalize(raw)
+        return text.equals("Row Labels", ignoreCase = true) || text.equals("ราคา", ignoreCase = true)
+    }
+
+    private fun parsePivotSummaryRows(sheet: Sheet, pivot: PivotMapping): List<PriceRow> {
+        val detailRows = mutableListOf<PriceRow>()
+        var totalQty: Double? = null
+        var totalValue: Double? = null
+        var gpRow: PriceRow? = null
+
+        for (rowIndex in (pivot.headerRowIndex + 1)..sheet.lastRowNum) {
+            val row = sheet.getRow(rowIndex) ?: continue
+            val rawPrice = CellUtils.getCellString(row.getCell(pivot.price))
+            if (rawPrice.isBlank()) {
+                if (detailRows.isNotEmpty() && totalQty != null) break
+                continue
+            }
+
+            val rawQty = CellUtils.getCellString(row.getCell(pivot.qty))
+            val qty = normalizeNumber(rawQty).toDoubleOrNull()
+            val explicitValue = pivot.value?.let { normalizeNumber(CellUtils.getCellString(row.getCell(it))).toDoubleOrNull() }
+
+            if (isPivotTotalLabel(rawPrice)) {
+                totalQty = qty
+                totalValue = explicitValue
+                continue
+            }
+
+            if (normalize(rawPrice).equals("GP", ignoreCase = true)) {
+                gpRow = PriceRow(price = null, qty = null, value = explicitValue, isGP = true, gpPercent = CellUtils.parsePercent(rawQty))
+                break
+            }
+
+            val price = normalizeNumber(rawPrice).toDoubleOrNull() ?: continue
+            val value = explicitValue ?: qty?.let { price * it }
+            detailRows.add(PriceRow(price = price, qty = qty, value = value))
+        }
+
+        if (detailRows.isEmpty()) return emptyList()
+        val summedQty = totalQty ?: detailRows.sumOf { it.qty ?: 0.0 }
+        val summedValue = totalValue ?: detailRows.sumOf { it.value ?: 0.0 }
+        return detailRows + listOfNotNull(
+            PriceRow(price = null, qty = summedQty, value = summedValue, isTotal = true),
+            gpRow
+        )
+    }
+
+    private fun isPivotTotalLabel(raw: String): Boolean {
+        val text = normalize(raw)
+        return text.equals("Grand Total", ignoreCase = true) || text.equals("Total", ignoreCase = true)
+    }
+
+    private fun hasDocumentTitle(sheet: Sheet, config: ReaderConfig): Boolean =
+        (0..minOf(sheet.lastRowNum, 12)).any { rowIndex ->
             val row = sheet.getRow(rowIndex) ?: return@any false
             row.any { cell ->
                 val text = normalize(CellUtils.getCellString(cell)).lowercase()
                 text.isNotBlank() && config.documentKeywords.any { keyword -> text.contains(keyword) }
             }
         }
-        if (!titleFound) return false
-
-        val (date, branch) = parseDateAndBranch(sheet, config)
-        if (branch.isBlank()) return false
-
-        return detectHeaderAndColumns(sheet, config) != null
-    }
 
     private fun classifyAndBuildRow(rawPrice: String, rawQty: String, rawValue: String, config: ReaderConfig): PriceRow? {
         val numericPrice = normalizeNumber(rawPrice)
